@@ -5,6 +5,7 @@
 <title>Sistema de Treinos</title>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
@@ -139,6 +140,17 @@
   .setupbanner h2{font-family:'Space Grotesk',sans-serif;font-size:18px;margin:0 0 10px;}
   .setupbanner p{font-size:13.5px;line-height:1.6;color:var(--ink-soft);}
   .setupbanner code{background:#F1EFE8;padding:2px 6px;border-radius:5px;font-size:12.5px;}
+
+  .loginwrap{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;padding:16px;z-index:1000;}
+  .loginwrap.show{display:flex;}
+  .logincard{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px 24px;width:100%;max-width:340px;}
+  .logincard h2{margin:0 0 4px;font-family:'Space Grotesk',sans-serif;font-size:20px;}
+  .logincard p{margin:0 0 18px;font-size:13px;color:var(--ink-soft);}
+  .logincard label{display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin:12px 0 4px;}
+  .logincard input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:14px;}
+  .logincard button.primary{width:100%;margin-top:18px;padding:11px 16px;}
+  .logincard button.primary:disabled{opacity:.6;cursor:wait;}
+  .loginerr{color:var(--warn-ink);font-size:12.5px;min-height:18px;margin-top:10px;}
 </style>
 </head>
 <body>
@@ -146,6 +158,18 @@
   <div class="loading">Carregando dados...</div>
 </div>
 <div class="savehint" id="savehint">Salvo</div>
+<div class="loginwrap" id="loginwrap">
+  <form class="logincard" onsubmit="doLogin(event)">
+    <h2>Bio Corpus</h2>
+    <p>Sistema de Treinos — acesso restrito</p>
+    <label for="login_email">E-mail</label>
+    <input id="login_email" type="email" autocomplete="username" required>
+    <label for="login_senha">Senha</label>
+    <input id="login_senha" type="password" autocomplete="current-password" required>
+    <div class="loginerr" id="login_err"></div>
+    <button class="primary" id="login_btn" type="submit">Entrar</button>
+  </form>
+</div>
 
 <script>
 /* ================================================================
@@ -166,9 +190,11 @@ const firebaseConfig = {
 const FIREBASE_CONFIGURED = firebaseConfig.apiKey && firebaseConfig.apiKey.indexOf('COLE_AQUI')===-1;
 
 let db = null;
+let auth = null;
 if(FIREBASE_CONFIGURED){
   firebase.initializeApp(firebaseConfig);
   db = firebase.database();
+  auth = firebase.auth();
 }
 
 const PERSONAL_COLORS = {I:'var(--pI)',R:'var(--pR)',M:'var(--pM)',D:'var(--pD)',L:'var(--pL)',T:'var(--pT)'};
@@ -197,6 +223,7 @@ let fullBodyMode = false;
 let editingFullBodyActive = false;
 let relShowAlunos = true;
 let relShowPersonals = true;
+let autoFillPreview = null;
 
 function todayISO(){
   const d = new Date();
@@ -389,17 +416,29 @@ function planoLabel(aluno){
   return p ? p.label : '';
 }
 
-function nextTreinoForAluno(nomeAluno, beforeDateISO, beforeHora){
+function entriesBeforeForAluno(nomeAluno, beforeDateISO, beforeHora){
   const key = (d,h)=> d + String(h).padStart(2,'0');
   const limitKey = key(beforeDateISO, beforeHora==null?99:beforeHora);
-  const entries = state.agenda
+  return state.agenda
     .filter(e=> e.nome.trim().toLowerCase()===String(nomeAluno).trim().toLowerCase() && key(e.data,e.hora) < limitKey)
     .sort((a,b)=> key(a.data,a.hora).localeCompare(key(b.data,b.hora)));
+}
+
+function nextTreinoForAluno(nomeAluno, beforeDateISO, beforeHora){
+  const entries = entriesBeforeForAluno(nomeAluno, beforeDateISO, beforeHora);
   if(entries.length===0) return 'A';
   const last = entries[entries.length-1];
   const order = ['A','B','C'];
   const idx = order.indexOf(last.treino);
   return order[(idx+1)%3];
+}
+
+function lastPersonalForAluno(nomeAluno, beforeDateISO, beforeHora){
+  const entries = entriesBeforeForAluno(nomeAluno, beforeDateISO, beforeHora);
+  for(let i=entries.length-1; i>=0; i--){
+    if(entries[i].personal) return entries[i].personal;
+  }
+  return null;
 }
 
 function isoWeekRange(dateISO){
@@ -459,6 +498,143 @@ function autoFillAgendaForDate(dateISO){
   saveState();
   return added;
 }
+
+// Simula o preenchimento automático "inteligente": para cada aluno com horário fixo
+// no dia, mantém o treino sugerido pela rotação (A→B→C) e tenta escolher bloco +
+// Personal que não estourem nenhuma capacidade (Personal, estação/aparelho, limite
+// geral do horário) — dando preferência ao mesmo Personal do lançamento anterior do
+// aluno. Não grava nada em state.agenda; devolve uma lista de propostas para revisão.
+function simulateSmartAutoFill(dateISO){
+  const [y,m,d] = dateISO.split('-').map(Number);
+  const dow = new Date(y, m-1, d).getDay();
+
+  // contadores "em execução" por horário, começando do que já está lançado no dia
+  const running = {}; // hora -> {perPersonal:{}, perEstacao:{}, totalGeral:0}
+  const getBucket = (hora)=>{
+    if(!running[hora]){
+      const {perPersonal, perEstacao, totalGeral} = computeConflicts(dateISO, hora);
+      running[hora] = {
+        perPersonal: {...perPersonal},
+        perEstacao: {...perEstacao},
+        totalGeral: totalGeral
+      };
+    }
+    return running[hora];
+  };
+
+  const propostas = [];
+
+  state.alunos.forEach(aluno=>{
+    (aluno.horariosFixos||[]).filter(h=>h.dia===dow).forEach(h=>{
+      const hora = h.hora;
+      const jaExiste = state.agenda.some(e=> e.data===dateISO && e.hora===hora && e.nome.trim().toLowerCase()===aluno.nome.trim().toLowerCase());
+      if(jaExiste) return;
+
+      const bucket = getBucket(hora);
+      const treino = nextTreinoForAluno(aluno.nome, dateISO, hora);
+      const reasons = [];
+
+      // --- escolher Personal: preferir o mesmo do lançamento anterior, se tiver vaga ---
+      const preferido = lastPersonalForAluno(aluno.nome, dateISO, hora);
+      let personal = '';
+      const personalCabe = (code)=>{
+        const p = personalByCode(code);
+        if(!p) return false;
+        return (bucket.perPersonal[code]||0) < p.cap;
+      };
+      if(preferido && personalCabe(preferido)){
+        personal = preferido;
+      } else {
+        // fallback: personal com mais vaga sobrando no horário
+        let melhor = null, melhorFolga = -Infinity;
+        state.personals.forEach(p=>{
+          const folga = p.cap - (bucket.perPersonal[p.code]||0);
+          if(folga > melhorFolga){ melhorFolga = folga; melhor = p; }
+        });
+        if(melhor){
+          personal = melhor.code;
+          if(melhorFolga <= 0) reasons.push('personal'); // ninguém tinha vaga sobrando
+        }
+        if(preferido) reasons.push('personal-trocado'); // preferido existia mas não coube
+      }
+      if(personal && !personalCabe(personal) && !reasons.includes('personal')) reasons.push('personal');
+
+      // --- escolher Bloco: primeiro que não estoura nenhuma estação envolvida ---
+      const blocosDisponiveis = blocosParaTreino(treino);
+      let bloco = null, blocoConflita = false;
+      if(blocosDisponiveis.length){
+        let semConflito = null;
+        let menosPiorBloco = blocosDisponiveis[0], menosPiorExcesso = Infinity;
+        blocosDisponiveis.forEach(b=>{
+          const ex = exerciciosDoBloco(treino, b);
+          let excesso = 0, temConflito = false;
+          ex.forEach(nome=>{
+            const est = estacaoByName(nome);
+            if(est){
+              const usado = bucket.perEstacao[nome]||0;
+              if(usado + 1 > est.cap){ temConflito = true; excesso += (usado + 1 - est.cap); }
+            }
+          });
+          if(!temConflito && semConflito===null) semConflito = b;
+          if(excesso < menosPiorExcesso){ menosPiorExcesso = excesso; menosPiorBloco = b; }
+        });
+        if(semConflito!==null){ bloco = semConflito; }
+        else { bloco = menosPiorBloco; blocoConflita = true; reasons.push('estacao'); }
+      }
+
+      // --- checar limite geral do horário com essa adição ---
+      const limite = limiteHorario(dow, hora);
+      if(limite!==null && (limite===0 || (bucket.totalGeral+1) > limite)){
+        reasons.push('geral');
+      }
+
+      // atualiza os contadores "em execução" para as próximas propostas do mesmo horário
+      if(personal){ bucket.perPersonal[personal] = (bucket.perPersonal[personal]||0)+1; }
+      if(bloco!=null){
+        exerciciosDoBloco(treino, bloco).forEach(nome=>{
+          bucket.perEstacao[nome] = (bucket.perEstacao[nome]||0)+1;
+        });
+      }
+      bucket.totalGeral += 1;
+
+      propostas.push({
+        nome: aluno.nome, data: dateISO, hora, treino, bloco, personal,
+        conflict: reasons.length>0, reasons
+      });
+    });
+  });
+
+  return propostas.sort((a,b)=> a.hora-b.hora || a.nome.localeCompare(b.nome));
+}
+
+function runSmartAutoFill(){
+  const propostas = simulateSmartAutoFill(selectedDate);
+  autoFillPreview = propostas;
+  agendaNotice = propostas.length===0 ? 'Nenhum aluno novo para preencher (já lançados ou sem horário fixo nesse dia).' : '';
+  renderMain();
+}
+
+function cancelAutoFillPreview(){
+  autoFillPreview = null;
+  renderMain();
+}
+
+function applyAutoFillPreview(){
+  if(!autoFillPreview) return;
+  autoFillPreview.forEach(p=>{
+    state.agenda.push({
+      id: uid(), data: p.data, hora: p.hora, treino: p.treino, nome: p.nome,
+      personal: p.personal || '', bloco: p.bloco, confirmado: null, origemAuto: true
+    });
+  });
+  const total = autoFillPreview.length;
+  const comConflito = autoFillPreview.filter(p=>p.conflict).length;
+  autoFillPreview = null;
+  saveState();
+  agendaNotice = `${total} aluno(s) preenchido(s) automaticamente` + (comConflito>0 ? ` (${comConflito} com conflito para revisar).` : '.');
+  renderMain();
+}
+
 function estacaoByName(nome){ return state.estacoes.find(e=>e.nome===nome); }
 
 function diaSemanaFromData(dataISO){
@@ -563,6 +739,7 @@ function render(){
       ${navBtn('limites','calendar-event','Limites de horário')}
       ${navBtn('ajuda','help-circle','Ajuda')}
       <a class="navbtn" href="https://open.spotify.com/" target="_blank" rel="noopener">🎵 Spotify</a>
+      <button class="navbtn" onclick="doLogout()">Sair</button>
       <div class="devcredit">Dev by joaoczr</div>
     </div>
     <div class="main" id="main"></div>
@@ -777,9 +954,12 @@ function renderAgenda(){
 
       <div id="f_error" style="color:var(--warn-ink);font-size:12.5px;margin-top:8px;">${agendaNotice}</div>
       <div style="margin-top:10px;">
-        <button class="ghost" onclick="runAutoFill()">${icon('calendar-event')} preencher automaticamente (horários fixos)</button>
+        <button class="ghost" onclick="runSmartAutoFill()">${icon('calendar-event')} preencher automaticamente (sugestão inteligente)</button>
+        <button class="ghost" onclick="runAutoFill()">${icon('calendar-event')} preencher rápido (sem Personal/Bloco)</button>
       </div>
     </div>
+
+    ${autoFillPreviewHtml()}
 
     ${alerts.length? `<div class="alertbar">${icon('alert-triangle')} ${alerts.length} conflito${alerts.length>1?'s':''} em ${fmtDatePt(selectedDate)}: ${alerts.join(' · ')}</div>` : ''}
 
@@ -787,7 +967,47 @@ function renderAgenda(){
   `;
 }
 
-function changeDate(v){ selectedDate = v; renderMain(); }
+function reasonLabel(r){
+  return {personal:'Personal lotado', 'personal-trocado':'Personal preferido indisponível', estacao:'Aparelho lotado', geral:'Limite geral do horário'}[r] || r;
+}
+
+function autoFillPreviewHtml(){
+  if(!autoFillPreview || !autoFillPreview.length) return '';
+  const comConflito = autoFillPreview.filter(p=>p.conflict).length;
+  const rows = autoFillPreview.map(p=>{
+    const personalNome = p.personal ? (personalByCode(p.personal)?.nome || p.personal) : '—';
+    const blocoTxt = p.bloco!=null ? `Bloco ${p.bloco}` : '—';
+    const status = p.conflict
+      ? `<span class="badge warn" title="${escapeHtml(p.reasons.map(reasonLabel).join(', '))}">${icon('alert-triangle')} revisar</span>`
+      : `<span class="badge ok">ok</span>`;
+    return `<tr>
+      <td>${escapeHtml(p.nome)}</td>
+      <td>${p.hora}h</td>
+      <td>${escapeHtml(p.treino)}</td>
+      <td>${blocoTxt}</td>
+      <td>${escapeHtml(personalNome)}</td>
+      <td>${status}</td>
+    </tr>`;
+  }).join('');
+  return `
+    <div class="card">
+      <div class="sectiontitle">Prévia do preenchimento automático — ${autoFillPreview.length} aluno(s)${comConflito>0 ? `, ${comConflito} com conflito` : ''}</div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Aluno</th><th>Hora</th><th>Treino</th><th>Bloco</th><th>Personal</th><th>Status</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div class="small" style="margin-top:8px;">Itens marcados "revisar" respeitam o treino sugerido pela rotação, mas não coube um Personal/bloco/limite geral totalmente livre — ajuste manualmente depois de aplicar, se preferir.</div>
+      <div style="margin-top:12px;">
+        <button class="primary" onclick="applyAutoFillPreview()">${icon('check')} aplicar à agenda</button>
+        <button class="ghost" onclick="cancelAutoFillPreview()">cancelar</button>
+      </div>
+    </div>
+  `;
+}
+
+function changeDate(v){ selectedDate = v; autoFillPreview = null; renderMain(); }
 
 function addEntry(){
   const hora = parseInt(document.getElementById('f_hora').value,10);
@@ -1759,7 +1979,59 @@ function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-loadState();
+function showLogin(msg){
+  document.getElementById('loginwrap').classList.add('show');
+  document.getElementById('login_err').textContent = msg||'';
+  const b=document.getElementById('login_btn'); b.disabled=false; b.textContent='Entrar';
+}
+function hideLogin(){ document.getElementById('loginwrap').classList.remove('show'); }
+
+function loginErrorMsg(code){
+  if(code==='auth/invalid-credential'||code==='auth/wrong-password'||code==='auth/user-not-found'||code==='auth/invalid-email') return 'E-mail ou senha incorretos.';
+  if(code==='auth/too-many-requests') return 'Muitas tentativas. Aguarde alguns minutos e tente de novo.';
+  if(code==='auth/network-request-failed') return 'Sem conexão. Verifique a internet.';
+  return 'Não foi possível entrar. Tente novamente.';
+}
+
+async function doLogin(ev){
+  ev.preventDefault();
+  const b=document.getElementById('login_btn');
+  b.disabled=true; b.textContent='Entrando...';
+  document.getElementById('login_err').textContent='';
+  try{
+    await auth.signInWithEmailAndPassword(
+      document.getElementById('login_email').value.trim(),
+      document.getElementById('login_senha').value
+    );
+  }catch(e){
+    showLogin(loginErrorMsg(e.code));
+  }
+}
+
+function doLogout(){ if(auth) auth.signOut(); }
+
+function resetSessionState(){
+  if(db){ db.ref('gym_state').off(); }
+  remoteListenerAttached = false;
+  document.getElementById('app').innerHTML = '<div class="loading">Carregando dados...</div>';
+  document.getElementById('login_senha').value = '';
+}
+
+if(!FIREBASE_CONFIGURED){
+  renderSetupBanner();
+} else {
+  let started = false;
+  auth.onAuthStateChanged(user=>{
+    if(user){
+      hideLogin();
+      if(!started){ started = true; loadState(); }
+    } else {
+      started = false;
+      resetSessionState();
+      showLogin('');
+    }
+  });
+}
 </script>
 </body>
 </html>
